@@ -2,9 +2,11 @@
 // finish it owns the server, and it closes for good once saved (or times out after SETUP_WINDOW_MIN, until the engine
 // restarts). The owner picks an owner password here for later dashboard writes. Keys go straight to the engine.
 // Each bee is designed from one sentence (OpenAI invents its name, rules, coins and look; the engine checks them),
-// then painted. A bee without its own portrait shows the placeholder mark, never the official bees' art.
+// then painted. OpenAI is optional: the owner can write a bee by hand (the engine checks it the same way) and upload a
+// picture instead. A bee without its own portrait shows the placeholder mark, never the official bees' art.
 import { useEffect, useState } from "react";
 import { BEE_MARK_URL } from "./BeeMark";
+import { portraitJpeg } from "./portrait";
 import { HIVE_DISCLAIMER } from "./types";
 
 interface StyleInfo {
@@ -33,13 +35,24 @@ interface Design {
   /** Why the bee runs on a different brain than the one it was designed for. */
   styleNote?: string;
 }
+/** A bee the owner writes by hand instead of having OpenAI design it. Coins as typed ("BTC, ETH"). */
+interface HandDraft {
+  name: string;
+  tagline: string;
+  rules: string;
+  coins: string;
+  style: string;
+}
 interface BeeDraft {
   /** What the owner typed: "How do you want this bee to trade?" */
   ask: string;
+  /** Written by hand (always, without an OpenAI key). */
+  manual: boolean;
+  hand: HandDraft;
   /** The designed bee (null until "Create my bee"). The name and tagline stay editable. */
   design: Design | null;
   img: string | null;
-  busy: "" | "design" | "paint";
+  busy: "" | "design" | "paint" | "upload";
   error: string;
 }
 
@@ -105,7 +118,7 @@ export function Setup() {
       .then((r) => r.json() as Promise<Status>)
       .then((s) => {
         setStatus(s);
-        setBees([0, 1, 2].map(() => ({ ask: "", design: null, img: null, busy: "", error: "" })));
+        setBees([0, 1, 2].map(() => ({ ask: "", manual: false, hand: { name: "", tagline: "", rules: "", coins: "", style: "boozy" }, design: null, img: null, busy: "", error: "" })));
       })
       .catch(() => setError("Can't reach the engine. Give it a few seconds, then reload."));
   }, []);
@@ -161,6 +174,32 @@ export function Setup() {
     }
   };
 
+  /** A bee written by hand: the engine checks it like a designed one (name, rules, coins on OKX, the brain it runs on). */
+  const writeOwn = async (i: number) => {
+    const h = bees[i]!.hand;
+    patch(i, { busy: "design", error: "" });
+    try {
+      const coins = h.coins.split(/[\s,;]+/).map((c) => c.trim().toUpperCase()).filter(Boolean);
+      const d = await post<Design>("manual", { name: h.name.trim(), tagline: h.tagline.trim(), rules: h.rules.trim(), coins, style: h.style });
+      patch(i, { design: d, busy: "" });
+    } catch (e) {
+      patch(i, { busy: "", error: fail(e) });
+    }
+  };
+
+  const patchHand = (i: number, p: Partial<HandDraft>) => setBees((bs) => bs.map((b, j) => (j === i ? { ...b, hand: { ...b.hand, ...p } } : b)));
+
+  const upload = async (i: number, file: File | undefined) => {
+    if (!file) return;
+    patch(i, { busy: "upload", error: "" });
+    try {
+      const r = await post<{ url: string }>("upload", { slot: i, jpeg: await portraitJpeg(file) });
+      patch(i, { img: r.url, busy: "" });
+    } catch (e) {
+      patch(i, { busy: "", error: fail(e) });
+    }
+  };
+
   const paint = async (i: number) => {
     const b = bees[i]!;
     if (!b.design) return;
@@ -186,7 +225,7 @@ export function Setup() {
           tagline: b.design!.tagline.trim(),
           rules: b.design!.rules,
           coins: b.design!.coins,
-          look: b.design!.look,
+          ...(b.design!.look ? { look: b.design!.look } : {}),
           image: !!b.img,
         })),
         hive,
@@ -375,8 +414,9 @@ export function Setup() {
           <section>
             <h2>OpenAI key</h2>
             <p>
-              Required. OpenAI designs each bee's trading style from a sentence you write, and paints its portrait. A design is one quick, cheap
-              ChatGPT call; a portrait takes about 40 seconds and a few cents. The key is only used on this page.
+              Optional. OpenAI designs each bee's trading style from a sentence you write, and paints its portrait. A design is one quick, cheap
+              ChatGPT call; a portrait takes about 40 seconds and a few cents. The key is only used on this page. Without one, you write your bees'
+              rules yourself and upload a picture for each.
             </p>
             {status.serverHasOpenAiKey ? (
               <p className="setup-ok">✓ The server already has an OpenAI key.</p>
@@ -400,9 +440,14 @@ export function Setup() {
               {hasOpenAi ? (
                 <button onClick={() => setStep(4)}>Next</button>
               ) : (
-                <button disabled={busy || openaiKey.trim().length < 8} onClick={() => run(async () => (await post("check-openai", { openaiKey: openaiKey.trim() }), setOpenaiOk(true)))}>
-                  {busy ? "Checking…" : "Check key"}
-                </button>
+                <>
+                  <button className="ghost" disabled={busy} onClick={() => (setOpenaiKey(""), setStep(4))}>
+                    Skip, I'll write them myself
+                  </button>
+                  <button disabled={busy || openaiKey.trim().length < 8} onClick={() => run(async () => (await post("check-openai", { openaiKey: openaiKey.trim() }), setOpenaiOk(true)))}>
+                    {busy ? "Checking…" : "Check key"}
+                  </button>
+                </>
               )}
             </div>
           </section>
@@ -412,8 +457,11 @@ export function Setup() {
           <section>
             <h2>Design your bees</h2>
             <p>
-              Three bees trade side by side and race each other. For each one, say how you want it to trade. OpenAI turns that into a name, a set of
-              rules and the coins it may trade, then you paint its portrait. Copied a winning bee's rules from{" "}
+              Three bees trade side by side and race each other.{" "}
+              {hasOpenAi
+                ? "For each one, say how you want it to trade. OpenAI turns that into a name, a set of rules and the coins it may trade, then you paint its portrait or upload a picture. Or write a bee yourself."
+                : "For each one, give it a name, write the rules it trades by and the coins it may trade, and upload a picture."}{" "}
+              Copied a winning bee's rules from{" "}
               <a href="https://beebots.tech" target="_blank" rel="noopener">
                 beebots.tech
               </a>
@@ -423,27 +471,66 @@ export function Setup() {
               {bees.map((b, i) => {
                 const d = b.design;
                 const problem = d ? nameProblem(d.name) : null;
+                const manual = b.manual || !hasOpenAi;
+                const h = b.hand;
                 return (
                   <div className="setup-bee" key={i} style={{ ["--bee" as string]: `var(--${["bizzy", "breezy", "boozy"][i]})` }}>
                     <div className={`setup-portrait ${b.img ? "" : "empty"}`}>
                       <img src={b.img ?? BEE_MARK_URL} alt={b.img ? `${d?.name ?? "bee"} portrait` : "no portrait yet"} />
                       {b.busy === "paint" && <span className="setup-portrait-busy">Painting… (~40 s)</span>}
+                      {b.busy === "upload" && <span className="setup-portrait-busy">Uploading…</span>}
                     </div>
-                    <label className="setup-label" htmlFor={`ask-${i}`}>
-                      How do you want this bee to trade?
-                    </label>
-                    <textarea
-                      id={`ask-${i}`}
-                      className="setup-input small"
-                      rows={3}
-                      maxLength={400}
-                      placeholder={`e.g. ${EXAMPLES[i]}`}
-                      value={b.ask}
-                      onChange={(e) => patch(i, { ask: e.target.value })}
-                    />
-                    <button className={d ? "ghost" : ""} disabled={!!b.busy || b.ask.trim().length < 3} onClick={() => void create(i)}>
-                      {b.busy === "design" ? "Designing…" : d ? "Create again" : "Create my bee"}
-                    </button>
+                    {manual ? (
+                      <>
+                        <label className="setup-label" htmlFor={`name-${i}`}>
+                          Write your bee
+                        </label>
+                        <input id={`name-${i}`} className="setup-input small" maxLength={24} placeholder="Name" value={h.name} onChange={(e) => patchHand(i, { name: e.target.value })} />
+                        <input className="setup-input small" maxLength={40} placeholder="Tagline (optional), e.g. the calm one" value={h.tagline} onChange={(e) => patchHand(i, { tagline: e.target.value })} />
+                        <textarea
+                          className="setup-input small"
+                          rows={4}
+                          maxLength={500}
+                          placeholder="Its rules in plain English (10-500 characters), e.g. Only buy BTC after a 5% dip, never chase a pump, get out when the trend turns."
+                          value={h.rules}
+                          onChange={(e) => patchHand(i, { rules: e.target.value })}
+                        />
+                        <input className="setup-input small mono" placeholder="Coins, e.g. BTC, ETH (empty = any coin)" value={h.coins} onChange={(e) => patchHand(i, { coins: e.target.value })} />
+                        <select className="setup-input small" value={h.style} onChange={(e) => patchHand(i, { style: e.target.value })} aria-label="Brain">
+                          {status.styles.map((st) => (
+                            <option key={st.id} value={st.id} title={st.blurb}>
+                              {st.label}: {st.blurb}
+                            </option>
+                          ))}
+                        </select>
+                        <button className={d ? "ghost" : ""} disabled={!!b.busy || !h.name.trim() || h.rules.trim().length < 10} onClick={() => void writeOwn(i)}>
+                          {b.busy === "design" ? "Checking…" : d ? "Check again" : "Use these rules"}
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <label className="setup-label" htmlFor={`ask-${i}`}>
+                          How do you want this bee to trade?
+                        </label>
+                        <textarea
+                          id={`ask-${i}`}
+                          className="setup-input small"
+                          rows={3}
+                          maxLength={400}
+                          placeholder={`e.g. ${EXAMPLES[i]}`}
+                          value={b.ask}
+                          onChange={(e) => patch(i, { ask: e.target.value })}
+                        />
+                        <button className={d ? "ghost" : ""} disabled={!!b.busy || b.ask.trim().length < 3} onClick={() => void create(i)}>
+                          {b.busy === "design" ? "Designing…" : d ? "Create again" : "Create my bee"}
+                        </button>
+                      </>
+                    )}
+                    {hasOpenAi && (
+                      <button className="link" disabled={!!b.busy} onClick={() => patch(i, { manual: !b.manual, error: "" })}>
+                        {b.manual ? "Let OpenAI design it instead" : "Or write it yourself"}
+                      </button>
+                    )}
 
                     {d && (
                       <div className="setup-design">
@@ -456,8 +543,23 @@ export function Setup() {
                         </div>
                         {d.styleNote && <p className="setup-note small">{d.styleNote}</p>}
                         <p className="setup-rules">{d.rules}</p>
-                        <button className={b.img ? "ghost" : ""} disabled={!!b.busy} onClick={() => void paint(i)}>
-                          {b.busy === "paint" ? "Painting… (~40 s)" : b.img ? "Paint again" : "Generate your bee's portrait"}
+                        {hasOpenAi && d.look && (
+                          <button className={b.img ? "ghost" : ""} disabled={!!b.busy} onClick={() => void paint(i)}>
+                            {b.busy === "paint" ? "Painting… (~40 s)" : b.img ? "Paint again" : "Generate your bee's portrait"}
+                          </button>
+                        )}
+                        <input
+                          id={`upload-${i}`}
+                          type="file"
+                          accept="image/*"
+                          hidden
+                          onChange={(e) => {
+                            void upload(i, e.target.files?.[0]);
+                            e.target.value = "";
+                          }}
+                        />
+                        <button className={b.img || (hasOpenAi && d.look) ? "ghost" : ""} disabled={!!b.busy} onClick={() => document.getElementById(`upload-${i}`)?.click()}>
+                          {b.busy === "upload" ? "Uploading…" : b.img ? "Upload a different picture" : "Upload a picture"}
                         </button>
                       </div>
                     )}
@@ -467,7 +569,7 @@ export function Setup() {
               })}
             </div>
             <div className="setup-actions">
-              {!beesReady && <span className="dim small setup-hint">Create all three bees and paint their portraits to carry on.</span>}
+              {!beesReady && <span className="dim small setup-hint">Create all three bees and give each a portrait to carry on.</span>}
               <button className="ghost" onClick={() => setStep(3)}>
                 Back
               </button>

@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { BeeEdit } from "./BeeEdit";
 import { EquityChart } from "./EquityChart";
 import { BEE_META, byCode, fallbackText, type BeeName, type PublicBee } from "./types";
 import type { Curve, FeedState } from "./useFeed";
@@ -67,6 +69,7 @@ export function BeeColumn({ name, bee, curve, baseline, rank, gap, flash, choose
   const p = bee?.position ?? null;
   const flashing = flash && Date.now() - flash.at < 2500;
   const cap = bee?.cap ?? null;
+  const [editing, setEditing] = useState(false);
 
   return (
     <section className={`bee ${flashing ? `flash-${flash.kind}` : ""}`} style={{ ["--bee" as string]: meta.color, ["--bee-glow" as string]: meta.glow }}>
@@ -86,12 +89,18 @@ export function BeeColumn({ name, bee, curve, baseline, rank, gap, flash, choose
               {meta.rules}
             </div>
           )}
+          {!editing && (
+            <button type="button" className="keeper-link bee-edit-open" title={`Change ${meta.short}'s rules or picture (owner password)`} onClick={() => setEditing(true)}>
+              Edit
+            </button>
+          )}
         </div>
         <div className="rank">
           <div className="rank-n">#{rank}</div>
           {gap !== null && <div className="rank-gap num">{gap === 0 ? "leading" : `${money(gap)} behind`}</div>}
         </div>
       </header>
+      {editing && <BeeEdit name={name} onClose={() => setEditing(false)} />}
 
       <div className="equity">
         <div className="equity-value num">{bee ? money(bee.equityUsd) : "–"}</div>

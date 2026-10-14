@@ -18,6 +18,8 @@ const BEES = [
   { name: "Donny", style: "boozy", tagline: "the loud one", rules: "Only trade TRUMP. Go long when it pumps.", coins: ["TRUMP"], look: "a bee in a red cap", image: true },
   { name: "Rex", style: "boozy", tagline: "the wild one", rules: "Chase whatever is pumping hardest this week.", coins: [], look: "a bee with a dinosaur hoodie", image: true },
 ];
+/** Just enough of a JPEG for the engine's check (it only looks at the start and the size). */
+const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 7)]);
 const ACCEPT = { notAdvice: true, paperDefault: true, ownRisk: true };
 const SAVE = { jevKey: "good-jev-key", openaiKey: "sk-test-key", ownerPassword: "correct horse", accept: ACCEPT, bees: BEES, hive: false };
 
@@ -207,12 +209,44 @@ describe("setup", () => {
     expect((await t.post("/setup/save", { ...SAVE, bees: bare })).status).toBe(400);
   });
 
-  it("needs an OpenAI key to save", async () => {
+  it("saves without an OpenAI key: bees written by hand, with uploaded portraits", async () => {
     const t = await boot();
-    t.paintAll();
     const noKey: Record<string, unknown> = { ...SAVE };
     delete noKey.openaiKey;
+    // No portraits yet: refused.
     expect((await t.post("/setup/save", noKey)).status).toBe(400);
+    for (const slot of [0, 1, 2]) expect((await t.post("/setup/upload", { slot, jpeg: JPEG.toString("base64") })).status).toBe(200);
+    const manual = BEES.map(({ name, style, tagline, rules, coins }) => ({ name, style, tagline, rules, coins, image: true }));
+    expect((await t.post("/setup/save", { ...noKey, bees: manual })).status).toBe(200);
+    const s = loadSettings(t.settingsPath)!;
+    expect(s.openaiKey).toBeUndefined();
+    expect(s.bees.map((b) => b.image)).toEqual([true, true, true]);
+    expect(readFileSync(join(imageDir(t.settingsPath), "bee2.jpg"))).toEqual(JPEG);
+  });
+
+  it("checks a bee written by hand like a designed one", async () => {
+    const t = await boot();
+    const ok = await t.post("/setup/manual", { name: "Granny", tagline: "calm one", rules: "Buy BTC dips and hold them for days.", coins: ["btc"], style: "breezy" });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toMatchObject({ name: "Granny", tagline: "the calm one", coins: ["BTC"], baseStyle: "breezy", styleLabel: "Trend" });
+    // A coin outside Trend's list puts the bee on Momentum, and says why.
+    expect(await (await t.post("/setup/manual", { name: "Granny", rules: "Buy SOL dips and hold them.", coins: ["SOL"], style: "breezy" })).json()).toMatchObject({ baseStyle: "boozy" });
+    expect((await t.post("/setup/manual", { name: "Bizzy Bee", rules: "Buy BTC dips and hold them.", coins: [] })).status).toBe(400);
+    expect((await t.post("/setup/manual", { name: "Granny", rules: "too short", coins: [] })).status).toBe(400);
+    const bad = await t.post("/setup/manual", { name: "Granny", rules: "Buy NOPE dips and hold them.", coins: ["NOPE"] });
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: string }).error).toMatch(/NOPE isn't tradable/);
+  });
+
+  it("only takes a JPEG of up to 600 KB as an uploaded portrait", async () => {
+    const t = await boot();
+    expect((await t.post("/setup/upload", { slot: 0, jpeg: Buffer.from("not a picture at all, just some text that is long enough to pass the size floor of the check here ok").toString("base64") })).status).toBe(400);
+    expect((await t.post("/setup/upload", { slot: 3, jpeg: JPEG.toString("base64") })).status).toBe(400);
+    const big = Buffer.concat([JPEG, Buffer.alloc(600 * 1024)]);
+    expect((await t.post("/setup/upload", { slot: 0, jpeg: big.toString("base64") })).status).toBe(400);
+    const r = await t.post("/setup/upload", { slot: 0, jpeg: `data:image/jpeg;base64,${JPEG.toString("base64")}` });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toMatchObject({ url: expect.stringMatching(/^\/bee-image\/bee1\?v=/) });
   });
 
   it("re-checks coins and the brain on save: unknown coins dropped, style forced from the coins", async () => {

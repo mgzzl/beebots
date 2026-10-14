@@ -64,7 +64,8 @@ async function rig(opts: { hash?: string | null; env?: ConstructorParameters<typ
   const door = new LabDoor({ store, rounds: keeper, knownCoins: () => ["BTC", "ETH", "SOL"], effectiveCoins: (id, coins) => effectiveCoins(SLOTS[id].style, SLOTS[id].coins, coins) });
   const hash = opts.hash === undefined ? HASH : opts.hash;
   const gate = new PasswordGate("x-owner-password", () => hash, "owner password");
-  const http = new KeeperHttp({ keeper, settings, door, gate, name: (id) => SLOTS[id].name });
+  const portraits: Array<{ bee: BeeId; jpeg: Buffer }> = [];
+  const http = new KeeperHttp({ keeper, settings, door, gate, name: (id) => SLOTS[id].name, setPortrait: (bee, jpeg) => portraits.push({ bee, jpeg }) });
   const hive = opts.hive
     ? new Hive({ path: join(dir, "hive.json"), url: "https://hive.test", mode: "dry", source: () => ({ startedAt: 0, startEquityUsd: 333, bees: [] }), db, ownerPasswordHash: () => hash, gate, fetch: (async () => new Response("{}")) as unknown as typeof fetch })
     : undefined;
@@ -90,7 +91,7 @@ async function rig(opts: { hash?: string | null; env?: ConstructorParameters<typ
     const r = await fetch(`${base}/lab/overlay`, { method: "POST", headers: { "content-type": "application/json", "x-lab-ts": ts, "x-lab-sig": labSignature(key, ts, "POST", "/lab/overlay", raw) }, body: raw });
     return r.status;
   };
-  return { base, post, get, deliver, keeper, settings, store, door, hooks, path, dir, db };
+  return { base, post, get, deliver, keeper, settings, store, door, hooks, path, dir, db, portraits };
 }
 
 /** A made-up address on a home or office network (never a real one), for the "Zapier cannot reach this" checks. */
@@ -112,6 +113,14 @@ describe("beekeeper routes: the owner password", () => {
     expect(r.keeper.enabled).toBe(false);
     expect(existsSync(r.path)).toBe(false);
     expect(r.hooks).toEqual([]);
+    // the owner's own edits too (a fresh gate: eight wrong passwords above would lock it)
+    const edits = await rig();
+    for (const p of ["/keeper/rules", "/keeper/portrait"]) {
+      expect((await edits.post(p, { bee: "bee1", rules: RULES, coins: [] }, null)).status).toBe(401);
+      expect((await edits.post(p, { bee: "bee1", rules: RULES, coins: [] }, "wrong horse!")).status).toBe(401);
+    }
+    expect(edits.store.overlay("bee1")).toBeNull();
+    expect(edits.portraits).toEqual([]);
 
     const unset = await rig({ hash: null });
     const res = await unset.post("/keeper/connect", { hookUrl: HOOK, publicUrl: PUBLIC });
@@ -383,5 +392,44 @@ describe("beekeeper settings: addresses", () => {
     } catch (e) {
       expect((e as Error).message).not.toContain("secret-path");
     }
+  });
+});
+
+describe("owner routes: the owner's own rules and portrait", () => {
+  it("sets a bee's rules at once, again and again (no 20-hour wait for the owner), and Undo takes them back", async () => {
+    const r = await rig();
+    const one = await r.post("/keeper/rules", { bee: "bee3", rules: "Only trade BTC and ETH, and never hold overnight.", coins: ["btc", "ETH"] });
+    expect(one.status).toBe(200);
+    expect(liveRules(SLOTS.bee3, r.store.overlay("bee3"))).toEqual({ rules: "Only trade BTC and ETH, and never hold overnight.", coins: ["BTC", "ETH"] });
+    expect(one.body.keeper!.entries).toMatchObject([{ action: "rewrote", bee: "bee3", quip: "Zip gets new rules from its owner.", reason: "Edited by the owner from the dashboard." }]);
+    expect((await r.post("/keeper/rules", { bee: "bee3", rules: "Second thoughts: chase the loudest coin again.", coins: [] })).status).toBe(200);
+    expect(liveRules(SLOTS.bee3, r.store.overlay("bee3")).rules).toBe("Second thoughts: chase the loudest coin again.");
+    // the Beekeeper leaves a bee the owner just edited alone for 20 hours
+    expect(r.keeper.openBees()).toEqual(["bee1", "bee2"]);
+    expect((await r.post("/keeper/rollback", { bee: "bee3" })).body).toMatchObject({ ok: true, restored: "previous" });
+    expect((await r.post("/keeper/rollback", { bee: "bee3" })).body).toMatchObject({ ok: true, restored: "owner" });
+  });
+
+  it("checks the owner's rules like the Beekeeper's", async () => {
+    const r = await rig();
+    expect((await r.post("/keeper/rules", { bee: "bee9", rules: RULES, coins: [] })).status).toBe(400);
+    expect((await r.post("/keeper/rules", { bee: "bee1", rules: "short", coins: [] })).status).toBe(400);
+    const coin = await r.post("/keeper/rules", { bee: "bee1", rules: RULES, coins: ["NOPE"] });
+    expect(coin.status).toBe(400);
+    expect(coin.body.error).toBe("NOPE isn't tradable on OKX right now.");
+    expect((await r.post("/keeper/rules", { bee: "bee1", rules: RULES, coins: [], leverage: 50 })).status).toBe(400);
+    expect(r.store.overlay("bee1")).toBeNull();
+  });
+
+  it("takes a new portrait: a JPEG of up to 600 KB", async () => {
+    const r = await rig();
+    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(300 * 1024, 7)]);
+    const ok = await r.post("/keeper/portrait", { bee: "bee2", jpeg: jpeg.toString("base64") });
+    expect(ok.status).toBe(200);
+    expect(ok.body.img).toMatch(/^\/bee-image\/bee2\?v=/);
+    expect(r.portraits).toEqual([{ bee: "bee2", jpeg }]);
+    expect((await r.post("/keeper/portrait", { bee: "bee2", jpeg: Buffer.from("x".repeat(500)).toString("base64") })).status).toBe(400);
+    expect((await r.post("/keeper/portrait", { bee: "bee2", jpeg: Buffer.concat([jpeg, Buffer.alloc(400 * 1024)]).toString("base64") })).status).toBe(400);
+    expect(r.portraits).toHaveLength(1);
   });
 });

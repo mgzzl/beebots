@@ -14,6 +14,21 @@
 		}
 	}
 
+	# Portrait uploads (a base64 JPEG of up to 600 KB): on Setup, and the owner's from the dashboard (owner password).
+	# Listed before @setup and @keeper so only these two paths get the bigger body limit.
+	@upload {
+		method POST
+		path /setup/upload /keeper/portrait
+	}
+	handle @upload {
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy engine:8080 {
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
 	# First-run Setup writes. The engine only accepts them before Setup is done, within the setup window.
 	@setup {
 		method POST

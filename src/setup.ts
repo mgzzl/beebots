@@ -7,9 +7,9 @@
 // After a save the engine exits and Docker restarts it with the new settings, in paper trading.
 // Each bee is designed from one sentence ("how do you want this bee to trade?"): OpenAI invents its name, rules, coins
 // and look, the engine checks the coins against OKX's live list and picks the brain it runs on, then OpenAI paints it.
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+// OpenAI is optional: the owner can write a bee's name, rules and coins by hand (/setup/manual, checked the same way)
+// and upload a portrait instead of painting one (/setup/upload).
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { dirname, join } from "node:path";
 import { z } from "zod";
 import { BEES } from "./config.js";
 import { hashPassword, MAX_PASSWORD, MIN_PASSWORD, readJson, send } from "./gate.js";
@@ -20,6 +20,7 @@ import { BREEZY_COINS } from "./bees/breezy.js";
 import { deriveStyle } from "./bees/custom.js";
 import { fetchXperpCoins } from "./okx/public.js";
 import { checkOpenAiKey, designBee, OpenAiError, paintBee, type BeeDesign } from "./openai.js";
+import { imagePath, parsePortrait, UPLOAD_MAX_BODY, writePortrait } from "./portrait.js";
 import { safeError } from "./redact.js";
 import { clientAddr } from "./visitors.js";
 import { BeeSchema, isReservedName, saveSettings, STYLE_INFO, STYLES, type Settings } from "./settings.js";
@@ -100,22 +101,14 @@ export function styleNote(wanted: BeeDesign["baseStyle"], got: BeeDesign["baseSt
   return `${STYLE_INFO[wanted].label} only trades ${list(only)}, so ${what} this bee runs on ${STYLE_INFO[got].label}.`;
 }
 
-export function imageDir(settingsPath: string): string {
-  return join(dirname(settingsPath), "bee-images");
-}
-
-export function imagePath(settingsPath: string, slot: string): string | null {
-  if (!(BEES as readonly string[]).includes(slot)) return null;
-  const p = join(imageDir(settingsPath), `${slot}.jpg`);
-  return existsSync(p) ? p : null;
-}
+export { imageDir, imagePath } from "./portrait.js";
 
 const Accept = z.object({ notAdvice: z.literal(true), paperDefault: z.literal(true), ownRisk: z.literal(true) });
-/** A Setup-made bee: designed (rules, look) and painted. */
+/** A Setup-made bee: designed or written by hand (rules), painted or uploaded (portrait). */
 const SetupBee = BeeSchema.extend({
   name: BeeSchema.shape.name.refine((n) => !isReservedName(n), { message: "that name belongs to an official bee" }),
   rules: z.string().trim().min(10).max(500),
-  look: z.string().trim().min(3).max(400),
+  look: z.string().trim().max(400).optional(),
   image: z.literal(true, { errorMap: () => ({ message: "every bee needs its portrait" }) }),
 });
 const optKey = z
@@ -218,7 +211,7 @@ export class Setup {
       send(res, 410, { error: TIMED_OUT, timedOut: true });
       return true;
     }
-    if (path === "/setup/design" || path === "/setup/paint" || path === "/setup/check-jev" || path === "/setup/check-gemini" || path === "/setup/check-openai") {
+    if (["/setup/design", "/setup/paint", "/setup/manual", "/setup/upload", "/setup/check-jev", "/setup/check-gemini", "/setup/check-openai"].includes(path)) {
       const addr = clientAddr(req.headers["x-forwarded-for"], req.socket.remoteAddress);
       const n = (this.calls.get(addr) ?? 0) + 1;
       if (n > MAX_CALLS_PER_ADDR) {
@@ -229,7 +222,7 @@ export class Setup {
     }
     let body: Record<string, unknown>;
     try {
-      body = (await readJson(req, MAX_BODY)) as Record<string, unknown>;
+      body = (await readJson(req, path === "/setup/upload" ? UPLOAD_MAX_BODY : MAX_BODY)) as Record<string, unknown>;
     } catch {
       send(res, 400, { error: "bad request" });
       return true;
@@ -306,10 +299,40 @@ export class Setup {
         if (this.paints >= MAX_PAINTS) return send(res, 429, { error: "That is a lot of portraits. Restart the engine to paint more." });
         this.paints++;
         const jpg = await this.paint(key, this.o.openai.imageModel, this.o.refDir, name || "a new bee", look);
-        const dir = imageDir(this.o.settingsPath);
-        mkdirSync(dir, { recursive: true });
-        writeFileSync(join(dir, `${BEES[slot]}.jpg`), jpg);
+        writePortrait(this.o.settingsPath, BEES[slot]!, jpg);
         return send(res, 200, { ok: true, url: `/bee-image/${BEES[slot]}?v=${Date.now()}` });
+      }
+
+      case "/setup/upload": {
+        const slot = Number(body.slot);
+        if (!Number.isInteger(slot) || slot < 0 || slot > 2) return send(res, 400, { error: "bad bee" });
+        const p = parsePortrait(body.jpeg);
+        if ("error" in p) return send(res, 400, { error: p.error });
+        writePortrait(this.o.settingsPath, BEES[slot]!, p.jpeg);
+        return send(res, 200, { ok: true, url: `/bee-image/${BEES[slot]}?v=${Date.now()}` });
+      }
+
+      case "/setup/manual": {
+        // A bee written by hand: the same checks as a designed one, with messages about what the owner typed.
+        const name = String(body.name ?? "").trim();
+        const rules = String(body.rules ?? "").replace(/\s+/g, " ").trim();
+        const coins = (Array.isArray(body.coins) ? body.coins : []).map((c) => String(c).trim().toUpperCase()).filter(Boolean);
+        const style = (STYLES as readonly string[]).includes(String(body.style)) ? (body.style as BeeDesign["baseStyle"]) : "boozy";
+        if (!/^[\p{L}\p{N} .'_-]{1,24}$/u.test(name)) return send(res, 400, { error: "Names are 1-24 letters, numbers, spaces and . ' _ -" });
+        if (isReservedName(name)) return send(res, 400, { error: reservedMsg(name) });
+        if (rules.length < 10 || rules.length > 500) return send(res, 400, { error: "Rules are 10-500 characters." });
+        if (coins.length > 20) return send(res, 400, { error: "At most 20 coins." });
+        let known: string[];
+        try {
+          known = await this.coinList();
+        } catch (err) {
+          log.warn("OKX coin list failed", { err: safeError(err) });
+          return send(res, 502, { error: "Couldn't read OKX's coin list just now. Try again in a minute." });
+        }
+        const unknown = coins.filter((c) => !known.includes(c.replace(/-.*$/, "")));
+        if (unknown.length) return send(res, 400, { error: `${unknown.slice(0, 5).join(", ")} ${unknown.length > 1 ? "aren't" : "isn't"} tradable on OKX EEA right now.` });
+        const d = finishDesign({ name, tagline: String(body.tagline ?? ""), rules, coins, baseStyle: style, look: "" }, known);
+        return send(res, 200, { ...d, styleLabel: STYLE_INFO[d.baseStyle].label });
       }
 
       case "/setup/save": {
@@ -319,7 +342,6 @@ export class Setup {
           return send(res, 400, { error: `Something is missing or not allowed (${what}).` });
         }
         const b = parsed.data;
-        if (!b.openaiKey && !this.o.openai.apiKey) return send(res, 400, { error: "Your bees need an OpenAI key (it designs and paints them)." });
         const missing = BEES.filter((slot) => imagePath(this.o.settingsPath, slot) === null);
         if (missing.length) return send(res, 400, { error: "Every bee needs its portrait before you start." });
         if (!b.geminiKey && !b.jevKey) return send(res, 400, { error: "Your bees need a Gemini key (or a Jev key) to make their calls." });

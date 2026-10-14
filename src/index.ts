@@ -1,4 +1,4 @@
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Alerts } from "./alerts.js";
 import { BREEZY_COINS } from "./bees/breezy.js";
@@ -23,8 +23,9 @@ import { createPublicApi } from "./okx/public.js";
 import { createOkxPublicRest } from "./okx/rest.js";
 import { safeError } from "./redact.js";
 import { startServer } from "./server.js";
-import { loadSettings, STYLE_INFO } from "./settings.js";
-import { imagePath, Setup } from "./setup.js";
+import { imagePath, writePortrait } from "./portrait.js";
+import { loadSettings, saveSettings, STYLE_INFO } from "./settings.js";
+import { Setup } from "./setup.js";
 import { UpdateCheck } from "./update.js";
 import { Visitors } from "./visitors.js";
 
@@ -52,11 +53,17 @@ function profile(cfg: Config | null, lab?: LabStore) {
             coins: live.coins,
             // A Setup-made bee only ever shows its own portrait (null = the dashboard's placeholder mark), never the
             // original bees' art, which belongs to the three official bees.
-            img: s.customImage && imagePath(cfg.settingsPath, id) ? `/bee-image/${id}` : s.fromSetup ? null : `/bees/${s.style}.jpg`,
+            img: s.customImage && imagePath(cfg.settingsPath, id) ? `/bee-image/${id}?v=${imageVersion(cfg.settingsPath, id)}` : s.fromSetup ? null : `/bees/${s.style}.jpg`,
           };
         })
       : [],
   };
+}
+
+/** Changes when the portrait file does, so a replaced portrait is not served from the browser's cache. */
+function imageVersion(settingsPath: string, id: string): number {
+  const p = imagePath(settingsPath, id);
+  return p ? Math.floor(statSync(p).mtimeMs) : 0;
 }
 
 /** No chooser key in the environment and no Setup file yet: serve only the Setup page until the owner fills it in. */
@@ -226,7 +233,19 @@ async function main() {
   });
   const keeperTimer = setInterval(() => keeper.tick(), 15_000);
   log.info("beekeeper", { on: keeper.enabled, everyHours: keeper.everyHours(), rewritesLive: BEES.filter((b) => labStore.overlay(b) !== null).length });
-  const keeperHttp = new KeeperHttp({ keeper, settings: keeperSettings, door, gate: ownerGate, name: (id) => cfg.slots[id].name });
+  // A portrait the owner uploads from the dashboard: shown at once, sent to the Hive on its next report, and kept in
+  // the Setup file so it survives a restart (installs without one keep it until the engine restarts).
+  const setPortrait = (id: (typeof BEES)[number], jpeg: Buffer) => {
+    writePortrait(cfg.settingsPath, id, jpeg);
+    cfg.slots[id].customImage = true;
+    const current = loadSettings(cfg.settingsPath);
+    const i = BEES.indexOf(id);
+    if (current?.bees[i] && !current.bees[i].image) {
+      current.bees[i] = { ...current.bees[i], image: true };
+      saveSettings(cfg.settingsPath, current);
+    }
+  };
+  const keeperHttp = new KeeperHttp({ keeper, settings: keeperSettings, door, gate: ownerGate, name: (id) => cfg.slots[id].name, setPortrait });
 
   // "Update available" on the dashboard (checks GitHub Releases; never installs anything).
   const updates = new UpdateCheck({ repo: cfg.update.repo, current: cfg.update.version, enabled: cfg.update.enabled });

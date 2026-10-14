@@ -13,6 +13,10 @@
 //
 // An overlay is ONLY rules text + coins for one bee (lab/brain.ts). The request schema is strict, so a request that
 // tries to set anything else (leverage, stops, caps, mode...) is refused outright.
+//
+// The owner can set an overlay too, from the dashboard (POST /keeper/rules, owner password, keeper-http.ts): the same
+// checks, except the 20-hour limit, which is there to slow the Beekeeper down, not the owner. An owner's edit still
+// counts as a change, so the Beekeeper leaves that bee alone for 20 hours after it, and Undo takes it back.
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
@@ -75,6 +79,7 @@ const OverlayReq = z
   .strict();
 const RoundReq = z.object({ note: z.string().trim().max(300).optional() }).strict();
 const RollbackReq = z.object({ bee: Bee, reason: z.string().trim().min(1).max(300) }).strict();
+const OWNER_REASON = "Edited by the owner from the dashboard.";
 
 /** Text the redactor would change can't be stored: it would come back masked (and it looks like a secret anyway). */
 const survivesRedact = (v: unknown) => JSON.stringify(redact(v)) === JSON.stringify(v);
@@ -169,7 +174,15 @@ export class LabDoor {
     return r;
   }
 
-  private trySetOverlay(raw: unknown, round: number | null): Reply {
+  /** The owner's own edit from the dashboard (the caller checked the owner password): `raw` is { bee, rules, coins }. */
+  ownerSet(raw: unknown, name: string): Reply {
+    const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    // Strict like the Zap's request: anything but rules and coins (leverage, stops, ...) is refused, not dropped.
+    if (Object.keys(r).some((k) => k !== "bee" && k !== "rules" && k !== "coins")) return { status: 400, body: { error: "invalid request" } };
+    return this.trySetOverlay({ bee: r.bee, rules: r.rules, coins: r.coins, reason: OWNER_REASON, metrics: { quip: `${name} gets new rules from its owner.`, idea: "edited by hand" } }, null, true);
+  }
+
+  private trySetOverlay(raw: unknown, round: number | null, owner = false): Reply {
     const p = OverlayReq.safeParse(raw);
     if (!p.success) return { status: 400, body: { error: "invalid request", issues: p.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).slice(0, 10) } };
     const { bee, reason, metrics } = p.data;
@@ -184,14 +197,14 @@ export class LabDoor {
     if (!survivesRedact(rules) || !survivesRedact(reason) || (metrics !== undefined && !survivesRedact(metrics))) {
       return { status: 400, body: { error: "rules, reason or metrics contain text the redactor would mask (long ids, addresses, key-like fields)" } };
     }
-    const limited = this.rateLimited(bee);
+    const limited = owner ? null : this.rateLimited(bee);
     if (limited) return limited;
     const no = round !== null ? (this.d.rounds?.forbids(bee) ?? null) : null;
     if (no) return { status: 409, body: { error: no } };
     const o = this.d.store.set(bee, rules, coins, reason, metrics, this.now());
-    log.info("beekeeper overlay set", { bee, overlay: o.id, coins: o.coins.length });
+    log.info(owner ? "owner overlay set" : "beekeeper overlay set", { bee, overlay: o.id, coins: o.coins.length });
     // The change is made: a failure to announce it must not turn the answer into an error.
-    this.after(() => this.d.notify?.(`Beekeeper: new rules for ${bee} (rewrite #${o.id}), applied on the next tick`));
+    this.after(() => this.d.notify?.(`${owner ? "Owner" : "Beekeeper"}: new rules for ${bee} (rewrite #${o.id}), applied on the next tick`));
     this.after(() => this.d.rounds?.rewrote(round, o, metrics));
     return { status: 200, body: { ok: true, bee, overlay: this.publicOverlay(o) } };
   }

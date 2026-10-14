@@ -35,13 +35,16 @@ Use code **MAGIC10** at checkout for 10% off.
      things from it later, like joining or leaving the Hive. Write it down.
    - paste a **Gemini key** for Gemini 4 Argon (see [Run it with Gemini 4 Argon](#run-it-with-gemini-4-argon)), or
      press **Use Jev instead** and paste a **Jev key** (from [console.typesafe.ai/keys](https://console.typesafe.ai/keys))
-   - paste an **OpenAI key** (required: it designs your bees and paints them; a few cents in total)
+   - paste an **OpenAI key** (optional: it designs your bees and paints them; a few cents in total). Without one,
+     press **Skip, I'll write them myself**: you then write each bee's name, rules and coins, and upload a picture
    - design your three bees. For each one, answer **How do you want this bee to trade?** in a sentence ("a Trump bee
      that only ever trades TRUMP", "a sleepy bee that only buys bitcoin dips"), press **Create my bee**, and OpenAI
      invents its name, tagline, trading rules and the coins it may trade. Rename it if you like, then press
-     **Generate your bee's portrait**. You can carry on once all three bees have their portraits.
+     **Generate your bee's portrait** (or **Upload a picture**). You can carry on once all three bees have their portraits.
    - choose whether to join **the Hive** (see below). "Not now" is fine; you can join later.
-4. Press **Start paper trading**. The engine restarts, and the dashboard goes live.
+4. Press **Start paper trading**. The engine restarts, and the dashboard goes live. Later, **Edit** under a bee's name
+   changes its rules, coins or picture (owner password). New rules apply on the bee's next tick, and the Beekeeper card
+   lists them with an **Undo**.
 
 | Agree to the rules | Pick an owner password | Design your bees |
 |---|---|---|

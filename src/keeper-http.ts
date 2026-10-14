@@ -7,6 +7,8 @@
 //   POST /keeper/disconnect   owner password: no more rounds (rewrites already made stay until undone)
 //   POST /keeper/round        owner password: start a round now
 //   POST /keeper/rollback     owner password: { bee }, undo the Beekeeper's latest rewrite of that bee
+//   POST /keeper/rules        owner password: { bee, rules, coins }, the owner's own rewrite (lab/door.ts ownerSet)
+//   POST /keeper/portrait     owner password: { bee, jpeg }, a new portrait for that bee (base64 JPEG, portrait.ts)
 // The hook URL is a secret (anyone who has it can start the owner's Zap): it is never served and never logged.
 import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -17,6 +19,7 @@ import { readJson, send, type PasswordGate } from "./gate.js";
 import { KEEPER_DEFAULT_EVERY_HOURS, parseRampStart, type Keeper, type KeeperConfig } from "./keeper.js";
 import type { LabDoor } from "./lab/door.js";
 import { log } from "./log.js";
+import { parsePortrait, UPLOAD_MAX_BODY } from "./portrait.js";
 import { redact, safeError } from "./redact.js";
 import { writePrivateJson } from "./settings.js";
 
@@ -131,6 +134,7 @@ export class KeeperSettings {
 
 const ConnectReq = z.object({ hookUrl: z.string().max(500), publicUrl: z.string().max(200).optional() }).strict();
 const RollbackReq = z.object({ bee: z.enum(BEES) }).strict();
+const PortraitReq = z.object({ bee: z.enum(BEES), jpeg: z.string() }).strict();
 
 export interface KeeperHttpDeps {
   keeper: Keeper;
@@ -139,10 +143,12 @@ export interface KeeperHttpDeps {
   /** The owner password gate, shared with the Hive's join and leave so wrong tries count once. */
   gate: PasswordGate;
   name: (bee: BeeId) => string;
+  /** Saves a new portrait for the bee and makes it the one shown (and sent to the Hive). Absent = no uploads. */
+  setPortrait?: (bee: BeeId, jpeg: Buffer) => void;
   now?: () => number;
 }
 
-const OWNER_ROUTES = new Set(["/keeper/connect", "/keeper/disconnect", "/keeper/round", "/keeper/rollback"]);
+const OWNER_ROUTES = new Set(["/keeper/connect", "/keeper/disconnect", "/keeper/round", "/keeper/rollback", "/keeper/rules", "/keeper/portrait"]);
 
 export class KeeperHttp {
   private scorecardCache: { at: number; body: string } | null = null;
@@ -196,7 +202,7 @@ export class KeeperHttp {
     if (gate === "bad") return this.reply(res, 401, { error: "That owner password is not right." });
     let body: unknown;
     try {
-      body = await readJson(req, MAX_BODY);
+      body = await readJson(req, path === "/keeper/portrait" ? UPLOAD_MAX_BODY : MAX_BODY);
     } catch {
       return this.reply(res, 400, { error: "bad request" });
     }
@@ -235,6 +241,27 @@ export class KeeperHttp {
       const round = await keeper.start("manual", "The owner asked for a round.");
       if (round === null) return this.reply(res, 409, { error: "No round was started. The experiment may be closing. See the engine's log." });
       return done({ round });
+    }
+    if (path === "/keeper/rules") {
+      const bee = (body as { bee?: unknown } | null)?.bee;
+      if (!(BEES as readonly unknown[]).includes(bee)) return this.reply(res, 400, { error: "Name the bee: bee1, bee2 or bee3." });
+      const r = this.d.door.ownerSet(body, this.d.name(bee as BeeId));
+      if (r.status !== 200) {
+        const b = r.body as { error?: string; coins?: string[] };
+        const error = b.coins?.length ? `${b.coins.join(", ")} ${b.coins.length > 1 ? "aren't" : "isn't"} tradable on OKX right now.` : b.error === "invalid request" ? "Rules are text and coins a list of tickers." : (b.error ?? "That didn't work.");
+        return this.reply(res, r.status, { error });
+      }
+      this.scorecardCache = null;
+      return done({ bee, overlay: (r.body as { overlay: unknown }).overlay });
+    }
+    if (path === "/keeper/portrait") {
+      const p = PortraitReq.safeParse(body);
+      if (!p.success || !this.d.setPortrait) return this.reply(res, 400, { error: "Name the bee and pick a picture." });
+      const pic = parsePortrait(p.data.jpeg);
+      if ("error" in pic) return this.reply(res, 400, { error: pic.error });
+      this.d.setPortrait(p.data.bee, pic.jpeg);
+      log.info("bee portrait replaced by the owner", { bee: p.data.bee, bytes: pic.jpeg.length });
+      return done({ bee: p.data.bee, img: `/bee-image/${p.data.bee}?v=${this.now()}` });
     }
     // /keeper/rollback
     const p = RollbackReq.safeParse(body);
